@@ -1,136 +1,84 @@
-# Simple FaaS (mini-faas)
+# Energy-aware anomaly detection on system logs
 
-A Kubernetes-native FaaS platform built from raw primitives — a custom CRD plus a `controller-runtime` reconciler — not Knative, not OpenFaaS. The point of the project is demonstrating how a serverless control plane actually works underneath those tools, not consuming one.
+**How much detection quality do you get for each joule spent?**
 
-[![Demo preview](assets/demo-preview.gif)](assets/demo.webm)
+This project compares anomaly detectors for system logs, from a one-line rule to neural networks,
+on both **detection performance** and **computational cost**: training time, inference energy and
+model size. It also tests two energy-saving techniques, smaller architectures and caching, and an
+optional int8-quantized LSTM.
 
-*Click the preview for the full demo (cold start → warm invocation → scale-to-zero).*
+## Pipeline
 
-```
-                     ┌─────────────────────────────┐
-                     │   Function (CRD)            │
-                     │   image, port, idleTimeout,  │
-                     │   minReplicas, maxReplicas   │
-                     └──────────────┬───────────────┘
-                                    │ watched by
-                                    ▼
-┌───────────────┐   reconcile   ┌─────────────────────┐
-│  Controller    │◄─────────────│  Deployment + Service │
-│ (manager pod)  │──creates/────►  (owned by Function)  │
-└───────────────┘   updates     └─────────┬─────────────┘
-                                           │
-        cold start trigger                │ scales 0 ⇄ N
-        (TriggeredReplicas)               ▼
-┌───────────────┐   patches    ┌─────────────────────┐
-│   Gateway      │─────────────►   idle-timeout loop   │
-│ /invoke/{name} │              (scale-to-zero after   │
-│ reverse proxy  │              idleTimeoutSeconds)    │
-└───────┬────────┘              └─────────────────────┘
-        │
-        ▼
-   /metrics ──► Prometheus (cold start count + duration histogram)
-```
+1. **Parse** raw log lines into event templates with our own implementation of Drain (He et al., 2017).
+2. **Group** events into sessions (one HDFS block = one session) and learn normal behaviour from normal sessions only.
+3. **Detect** anomalous sessions; thresholds are set on held-out normal sessions (1% false-positive target), never on test data.
+4. **Measure** precision, recall and F1 on 570,204 test sessions, plus the CPU time and energy of training and inference.
 
-## Status: what's actually verified here
+## Data
 
-This is a solo project, benchmarked and chaos-tested on a real cluster — not a toy that only runs a happy path once. Every number below came from a script run against a live cluster, not an estimate. Where something is untested, it's called out explicitly in its own section rather than implied by omission.
+- [DeepLog](https://dl.acm.org/doi/10.1145/3133956.3134015)'s HDFS split (Du et al., CCS 2017), as published in the
+  [logdeep](https://github.com/donglee-afar/logdeep) repository: 4,855 normal training sessions; 553,366 normal and
+  16,838 anomalous test sessions, as event-ID sequences.
+- [LogHub](https://github.com/logpai/loghub)'s labelled raw HDFS sample (2,000 lines), to measure parsing accuracy.
 
-## Core mechanics
+`get_data.py` fetches both from pinned commits and checks them against `data/SHA256SUMS`.
 
-| Mechanic | Where | Verified how |
-|---|---|---|
-| Scale-to-zero | `function_controller.go`, idle-timeout check in the reconcile loop | Left a Function idle past `idleTimeoutSeconds`, watched the Deployment's replica count go to 0 via `kubectl get deploy -w` |
-| Cold-start trigger | `cmd/gateway/main.go`, `/invoke/{name}` patches `TriggeredReplicas` | Hit a scaled-to-zero function through the gateway, confirmed pod creation in `kubectl get pods -w`, then confirmed it scaled back to zero after the idle window |
-| Decoupled trigger vs. floor | `TriggeredReplicas` field, separate from `MinReplicas` | This was a real bug: the original code reused one field for both the gateway's trigger and the floor, so any gateway-triggered cold start permanently blocked scale-to-zero afterward. Fixed by splitting the field; re-tested the same idle-timeout scenario above after the fix to confirm scale-to-zero resumed working |
-| Graceful shutdown | `cmd/gateway/main.go`, `SIGTERM`/`SIGINT` handling + `http.Server.Shutdown(ctx)` | See chaos test below |
-| Metrics | `promauto` counter + histogram, `/metrics` on the gateway | Confirmed Prometheus (deployed in-cluster) is actually scraping the endpoint — target shows `UP` in Prometheus's own target list, and `coldStartTotal`/`coldStartDuration` return real values via PromQL |
-| AWS deployment | `config/aws/*.yaml` | These manifests were pulled live off the running EC2/k3s cluster with `kubectl get ... -o yaml`, not reconstructed from memory — so what's in the repo matches what's actually deployed |
+## Results
 
-## Cold start vs. warm invocation
+Full tables and chart: [`results/report.md`](results/report.md).
 
-5 runs each, forced cold by resetting `minReplicas`/`triggeredReplicas` to zero and deleting the Deployment before each cold run (`benchmark.sh`, results in `benchmark-results.csv`):
+| detector | F1 (3 seeds for neural models) | inference CPU-s / 1,000 sessions | with cache | training CPU-s |
+|---|---|---|---|---|
+| MLP next-event, 16 units | 0.923 (0.915–0.930) | 0.42 | 0.017 | 40 |
+| MLP next-event, 64+64 units | 0.911 (0.903–0.923) | 0.52 | 0.022 | 58 |
+| LSTM DeepLog, 2x64 | 0.898 (0.833–0.936) | 3.4 | 0.067 | 254 |
+| LSTM DeepLog, int8 quantized | 0.898 (0.833–0.936) | 4.9 | 0.084 | 236 |
+| LSTM small, 1x16 | 0.788 (0.692–0.933) | 0.55 | 0.019 | 40 |
+| N-gram next-event | 0.797 | | | |
+| Unseen-event rule | 0.633 | | | |
+| PCA | 0.594 | | | |
+| Isolation Forest | 0.014 | | | |
 
-| Run | Cold (s) | Warm (s) |
-|---|---|---|
-| 1 | 2.70 | 0.044 |
-| 2 | 2.68 | 0.039 |
-| 3 | 2.65 | 0.036 |
-| 4 | 2.67 | 0.041 |
-| 5 | 2.69 | 0.038 |
+Run on an Intel i5-8350U laptop, single-threaded; energy is estimated from CPU time (see below), so all exact
+costs are in [`results/report.md`](results/report.md). Detection metrics are exact and identical on every run;
+timings vary by roughly ±30% between runs, so read costs as orders of magnitude.
 
-Cold start is roughly **65–70x** slower than a warm hit — expected for a scale-from-zero model, and the number exists because it was measured, not assumed. This is one benchmark run, not a statistically robust suite — see "What's genuinely untested."
+- **A 16-unit MLP beat the DeepLog-style LSTM:** F1 0.923 vs 0.898, at about 8x lower inference cost and 6x lower
+  training cost, and with far less variation between training seeds.
+- **Quantization backfired on this CPU:** int8 dynamic quantization shrank the model 3.5x (225 KB to 65 KB) and kept
+  F1 the same, but made inference about 40% slower. An "energy optimisation" has to be measured on the target hardware.
+- **Small is not automatically good:** the 16-unit LSTM's F1 ranged from 0.69 to 0.93 depending only on the seed.
+- **A one-line rule sets the bar:** flagging sessions that contain an event never seen in training reaches F1 0.63
+  with 97% precision for almost no energy. PCA and Isolation Forest do not beat it.
+- **Caching is a free energy saving:** 96.8% of sessions repeat an earlier sequence; scoring each distinct
+  sequence (or event history) once cut inference cost 2–50x with identical detections (verified by a test).
+- **Parsing:** our Drain implementation reaches 0.9975 grouping accuracy on LogHub's labelled HDFS sample.
 
-## Resilience: graceful shutdown under load
+![trade-off](results/tradeoff.png)
 
-Chaos test: send an in-flight request to a function with an artificial delay (`?delay=N` on the test function), kill the gateway pod mid-request, see what happens to that request.
+## Energy measurement
 
-- **First attempt, no shutdown handling**: pod killed instantly, in-flight request died immediately. Not acceptable for anything claiming to route live traffic.
-- **Added `SIGTERM` handling with a 10s shutdown timeout**: request still died, now failing at ~14.5s — the shutdown window was too short for the in-flight request to finish.
-- **Raised timeout to 25s**: request completed successfully, `200 OK` at ~15s into the delayed handler, well inside the shutdown budget. Verified two independent ways (through `kubectl port-forward` and from an in-cluster debug pod) to rule out the result being a quirk of the test method rather than the actual behavior.
+Energy is read from Intel RAPL when the user may read `/sys/class/powercap/intel-rapl:0/energy_uj`. On most Linux
+systems that needs root, so otherwise it is **estimated** as CPU-seconds x average power per busy core (default
+15 W / 4 cores, the lab machine's Intel i5-8350U; set `LOGAD_WATTS_PER_CORE` for another machine). All runs are
+single-threaded. The report always states which method was used.
 
-## Prerequisites
-
-- Docker
-- `kind` v0.23.0 (pinned — newer alphas have breaking changes) for local development, or an AWS account for the real deployment
-- `kubectl` v1.30.x
-- Go 1.21+
-- (optional, for the AWS path) AWS CLI v2, an EC2 instance (`t3.small` minimum — `t3.micro` is too memory-constrained for k3s)
-
-## Setup (local, `kind`)
+## Run it
 
 ```bash
-kind create cluster --name mini-faas
-kubectl apply -f config/crd/function-crd.yaml
-kubectl apply -f config/rbac/manager-rbac.yaml
-kubectl apply -f config/rbac/gateway-rbac.yaml
-kubectl apply -f config/deploy/manager-deployment.yaml
-kubectl apply -f config/deploy/gateway-deployment.yaml
-kubectl apply -f config/observability/prometheus.yaml
+python3 -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: LSTM detectors
+python3 get_data.py
+python3 run.py                       # minutes without PyTorch; the LSTMs add roughly half an hour on a laptop
+python3 -m unittest discover -s tests -t .
 ```
 
-Deploy a sample function and invoke it through the gateway:
+## Limitations
 
-```bash
-kubectl apply -f config/aws/function-sample.yaml   # works locally too, adjust image if needed
-kubectl port-forward svc/mini-faas-gateway 8080:8080
-curl http://localhost:8080/invoke/hello
-```
-
-## Setup (real deployment, AWS EC2 + k3s)
-
-See `config/aws/README.md` for the full walkthrough. Short version: provision a `t3.small` EC2 instance, install k3s, apply the manifests in `config/aws/`, point a NodePort Service at the gateway.
-
-**Known, deliberate gap**: the security group allows SSH (22) and the k3s API (6443) from `0.0.0.0/0`. That's an explicit choice, not an oversight — worth flagging if you're judging this as production-representative rather than a demo.
-
-## Run the benchmark / chaos test yourself
-
-```bash
-./benchmark.sh        # writes benchmark-results.csv
-```
-
-Chaos test is manual: trigger a delayed invocation, then `kubectl delete pod` the gateway mid-request, and watch whether the response completes.
-
-## What's genuinely untested
-
-- Only one 5-run benchmark session exists — no statistically robust multi-session suite, no load testing under concurrent requests
-- Prometheus is scraping and metrics are real, but there's no Grafana dashboard — numbers are read via raw PromQL, not visualized
-- AWS deployment is manual (SSH + `kubectl apply`), not CI/CD-automated — no GitHub Actions pipeline for this project
-- No multi-node testing — both local (`kind`) and AWS (`k3s`) runs are single-node
-- No tested behavior under `MaxReplicas` saturation / backpressure
-- AWS billing: free-tier assumptions haven't been reconfirmed against an actual billing-console check or budget alert
+- HDFS is a public Hadoop dataset, not telecom logs; it is the standard benchmark in this field.
+- Estimated energy ranks detectors by CPU cost; it is not a wattmeter reading.
+- Next-event thresholds are discrete (top-g), so test false-positive rates can differ from the 1% target.
+- Inference cost is measured in Python; absolute numbers would be lower in an optimised serving stack.
 
 ## Layout
-
-```
-api/v1alpha1/              Function CRD types + deepcopy
-internal/controller/       Reconciler: Deployment/Service lifecycle, idle-timeout scale-down
-cmd/manager/                Controller entrypoint (in-cluster deployment)
-cmd/gateway/                HTTP gateway: cold-start trigger, reverse proxy, /metrics
-functions/hello/           Minimal test function (supports ?delay=N for chaos testing)
-config/crd/                 CRD manifest
-config/rbac/                RBAC for manager + gateway
-config/deploy/               Local (kind) Deployment/Service manifests
-config/observability/        Prometheus ConfigMap + Deployment
-config/aws/                  AWS/k3s manifests, pulled live from the running cluster
-benchmark.sh                 Cold-vs-warm benchmark script, writes benchmark-results.csv
-```
